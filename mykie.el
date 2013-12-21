@@ -372,11 +372,11 @@ Example:
          (append args '(:default self-insert-command))))
 (put 'mykie:define-key-with-self-key 'lisp-indent-function 1)
 
-(defmacro mykie:set-keys (direction &rest args)
+(defmacro mykie:set-keys (keymap-or-order &rest args)
   "Set keybinds as `mykie' command.
 Examples:
   Set keybinds to global-map:
-  (mykie:set-keys 'global
+  (mykie:set-keys nil ; You can set 'global or global-map instead of nil too.
     \"C-a\"
     :default     '(beginning-of-line)
     :C-u         'mark-whole-buffer
@@ -402,12 +402,13 @@ Examples:
    :region 'query-replace-regexp
    \"b\"
    :C-u '(message \"called b\"))"
-  `(mykie:set-keys-core
-    (when (keymapp ,direction)
-      (symbol-name ,direction))
-    ,direction ,@args))
+  `(let ((order (or ,keymap-or-order 'global)))
+     (if (keymapp ,keymap-or-order)
+         (mykie:set-keys-core
+          (symbol-name ,keymap-or-order) order ,keymap-or-order ,@args)
+       (mykie:set-keys-core nil order global-map ,@args))))
 
-(defun mykie:set-keys-core (keymap-name direction &rest args)
+(defun mykie:set-keys-core (keymap-name order keymap &rest args)
   (lexical-let
       ((set-keys (lambda (func &optional keymap)
                    (loop with tmp = '()
@@ -425,15 +426,12 @@ Examples:
                                   (apply func keymap-name keymap tmp)
                                 (apply func tmp))
                               (setq tmp nil))))))
-    (case direction
+    (case order
       (global
        (funcall set-keys 'mykie:global-set-key))
       (with-self-key
        (funcall set-keys 'mykie:define-key-with-self-key))
-      (t (if (keymapp direction)
-             (funcall set-keys 'mykie:define-key-core direction)
-           (error "Key parse failed, make sure your setting"))))))
-(put 'mykie:set-keys 'lisp-indent-function 1)
+      (t (funcall set-keys 'mykie:define-key-core keymap)))))
 
 (unless mykie:conditions
   (mykie:initialize))
