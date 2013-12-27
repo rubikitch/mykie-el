@@ -23,17 +23,21 @@
 ;;; Commentary:
 ;; This program can register multiple functions to a keybind easily.
 ;; For example:
-;; (defun mykie-sample ()
-;;   (interactive)
-;;   (mykie
-;;    :default 'newline-and-indent
-;;    :region  'query-replace-regexp))
-;; (global-set-key (kbd "C-j") 'mykie-sample)
+;; (mykie:set-keys global-map ; <- you can specify nil to bind to global-map
+;;   "C-j" ; You don't need kbd macro
+;;   :default 'newline-and-indent   ; <- normal behavior
+;;   :region  'query-replace-regexp ; <- do query-replace-regexp in region
+;;   "C-a"
+;;   :default 'beginning-of-line
+;;   :C-u     '(message "hello") ; <- C-u + C-a, then you can see hello
+;;   ;; You can add more keybinds
+;;   ;; ...
+;;   )
 ;;
 ;; Above function call newline-and-indent by default,
 ;; But call query-replace-regexp function if you select region.
 ;;
-;; In short form:
+;; There are other way to bind a keybind:
 ;; (mykie:global-set-key "C-j" ; You don't need kbd macro
 ;;   :default 'newline-and-indent
 ;;   :region 'query-replace-regexp)
@@ -47,10 +51,13 @@
   '((when (region-active-p)
       (or (and current-prefix-arg
                :region&C-u)
+          (mykie:get-major-mode-state "region&")
+          (mykie:get-prog-mode-state "region&")
           :region))))
 
 (defvar mykie:prefix-arg-conditions
-  '((mykie:get-major-mode-state t)
+  '((mykie:get-major-mode-state "C-u&")
+    (mykie:get-prog-mode-state "C-u&")
     (mykie:get-thing-state 'email :prefix "C-u&")
     (mykie:get-thing-state 'url   :prefix "C-u&")
     (when current-prefix-arg
@@ -66,13 +73,15 @@
 (defvar mykie:normal-conditions
   '((when (mykie:repeat-p)   :repeat)
     (mykie:get-major-mode-state)
+    (mykie:get-prog-mode-state)
     (mykie:get-thing-state   'email)
     (mykie:get-thing-state   'url)
     (when (minibufferp)      :minibuff)
     (when (bobp)             :bobp)
     (when (eobp)             :eobp)
     (when (bolp)             :bolp)
-    (when (eolp)             :eolp)))
+    (when (eolp)             :eolp)
+    (when buffer-read-only   :readonly)))
 
 (defvar mykie:before-user-region-conditions '())
 (defvar mykie:after-user-region-conditions '())
@@ -89,21 +98,20 @@ Note: Order is important. Above list element have more priority than
 below elements. If you dislike :repeat's priority, then you can change
 this behavior by this variable.")
 
-(defun mykie:initialize ()
-  (setq mykie:conditions
-        (append
-         ;; REGION
-         mykie:before-user-region-conditions
-         mykie:region-conditions
-         mykie:after-user-region-conditions
-         ;; PREFIX-ARGUMENT
-         mykie:before-user-prefix-arg-conditions
-         mykie:prefix-arg-conditions
-         mykie:after-user-prefix-arg-conditions
-         ;; NORMAL
-         mykie:before-user-normal-conditions
-         mykie:normal-conditions
-         mykie:after-user-normal-conditions)))
+(defvar mykie:use-major-mode-key-override nil
+  "If this variable is non-nil, attach mykie's same global key function
+to major-mode's key function if the function is exists.
+To use this function, you need register your self-insert-key by using
+`mykie:set-keys' with 'with-self-key or `mykie:define-key-with-self-key'.
+Note this function is in development.")
+
+(defvar mykie:ignore-major-modes-for-self-insert-key '()
+  "major-mode's list that ignore mykie's function if this list
+contains current major-mode")
+
+(defvar mykie:ignore-minor-modes-for-self-insert-key '()
+  "minor-mode's list that ignore mykie's function if this list
+contains current minor-mode")
 
 (defvar mykie:region-before-init-hook '(mykie:region-init))
 (defvar mykie:region-after-init-hook  '(mykie:deactivate-mark))
@@ -118,7 +126,9 @@ this behavior by this variable.")
     (intern (format
              "mykie:%s:%s:%s:%s"
              (or keymap-name "")
-             (key-description key)
+             (replace-regexp-in-string
+              " " "_"
+              (key-description key))
              ;; Some programs check command name by
              ;; (string-match "self-insert-command" command-name)
              (if (eq (plist-get args :default) 'self-insert-command)
@@ -129,16 +139,34 @@ this behavior by this variable.")
                    if (eq k keymap)
                    return (- (length mykie:keymaps) i))))))
 
+(defvar mykie:get-fallback-function
+  (lambda (args)
+    (and (mykie:ignore-mode-p)
+         ;; Return default function
+         (plist-get args :default)))
+  "Fallback function that retiring fallback function's symbol.")
+
 ;; INTERNAL VARIABLES
 (defvar mykie:keymaps nil)
-
-;; DYNAMIC VARIABLES
 (defvar mykie:current-state nil)
 (defvar mykie:current-args '())
 (defvar mykie:current-point "")
 (defvar mykie:current-thing nil)
 (defvar mykie:region-str "")
 (defvar mykie:C-u-num nil)
+(defvar mykie:self-insert-keys '()
+  "This variable will store self-insert-key's key and mykie's args pair list.
+To use this variable, you need to use function `mykie:define-key-with-self-key'
+or `mykie:set-keys' with 'with-self-key argument.")
+
+(defvar mykie:attached-mode-list '()
+  "list that `mykie:attach-mykie-func-to' function attached mode name list.")
+
+(defvar-local mykie:prog-mode-flag nil
+  "Buffer local variable, t means this buffer is related programing mode.
+Otherwise nil.")
+(add-hook 'prog-mode-hook
+          '(lambda () (setq-local mykie:prog-mode-flag t)))
 
 (defun mykie:loop (&rest keybinds)
   (lexical-let*
@@ -169,6 +197,7 @@ Example
   \"m\" 'newline
   \"g\" '(if current-prefix-arg
              (keyboard-quit)))"
+  (mykie:run-hook 'before)
   (run-hooks 'pre-command-hook)
   (cond
    ((commandp func)
@@ -180,12 +209,37 @@ Example
     (funcall func))
    ((listp func)
     (funcall 'eval `(progn ,func))))
-  (run-hooks 'post-command-hook))
+  (run-hooks 'post-command-hook)
+  (mykie:run-hook 'after))
+
+(defun mykie:attach-mykie-func-to (&optional mode)
+  "Note this function is in development.
+Attach mykie's functions to the MODE's same key function without :default.
+Use the MODE's function as :default function.
+If you aren't specified the MODE, then use current major-mode by default.
+The MODE is mode name's symbol such as 'emacs-lisp-mode."
+  (condition-case err
+      (loop with mode        = (or mode major-mode)
+            with keymap-name = (concat (symbol-name mode) "-map")
+            with keymap      = (eval (intern keymap-name))
+            for (key args) in mykie:self-insert-keys
+            for mode-func = (lookup-key keymap key)
+            if (member mode mykie:attached-mode-list)
+            do (error "Mykie: already attached")
+            if (and (keymapp keymap)
+                    (functionp mode-func)
+                    (not (string-match "^mykie:" (symbol-name mode-func))))
+            do (mykie:clone-key
+                key args `(:default ,mode-func) `(,keymap-name . ,keymap))
+            finally (add-to-list 'mykie:attached-mode-list mode))
+    (error err)))
 
 (defun mykie:repeat-p ()
   (equal this-command last-command))
 
 (defun mykie:get-C-u-times ()
+  "Return times that your pushed C-u's times. And you can use mykie:C-u-num
+variable to get the times after do this function if you want."
   (setq mykie:C-u-num (truncate (log (or (car current-prefix-arg) 1) 4)))
   mykie:C-u-num)
 
@@ -196,23 +250,43 @@ Example
 THEN-FORM and ELSE-FORMS are then excuted just like in `if'."
   `(let ((it ,test-form))
      (if it ,then-form ,@else-forms)))
+(put 'mykie:aif 'lisp-indent-function 2)
 
 (defun* mykie:get-thing-state (thing &key prefix)
+  "Return :email, :url state.
+The THING is you can specify 'email or 'url.
+If the THING is 'email then check whether thing-at-point is email.
+Then if there is email, return :email.
+If the THING is 'url then check whether thing-at-point is url.
+Then if there is url, return :url.
+Also you can specify \"C-u&\" or \"region&\" to PREFIX.
+If you specify \"C-u&\", check whether there is current-prefix-arg.
+If you specify \"region&\", check whether region is active.
+If Result is true, then return prefix + thing state such as
+:C-u&url(if you specify \"&C-u\" to PREFIX in this case).
+You can use `mykie:current-thing' variable to get
+result(i.e., email address or url) after call this function."
   (lexical-let
-      ((thing-state (intern (concat ":" prefix (symbol-name thing)))))
-    (when (and (plist-get mykie:current-args thing-state)
+      ((thing-state (mykie:concat-prefix-if-exist thing prefix)))
+    (when thing-state
+      (case thing
+        ((url email)
+         (mykie:aif (thing-at-point thing)
+             (setq mykie:current-thing it)
+           (setq mykie:current-thing nil))
+         (when mykie:current-thing
+           thing-state))))))
+
+(defun mykie:concat-prefix-if-exist (state prefix)
+  (lexical-let
+      ((target-state (intern (concat ":" prefix (symbol-name state)))))
+    (when (and (plist-get mykie:current-args target-state)
                (or (not prefix)
                    (and prefix (equal "C-u&"    prefix)
                         current-prefix-arg)
                    (and prefix (equal "region&" prefix)
                         (region-active-p))))
-      (case thing
-        ((url email)
-         (mykie:aif (thing-at-point thing)
-                    (setq mykie:current-thing it)
-                    (setq mykie:current-thing nil))
-         (when mykie:current-thing
-           thing-state))))))
+      target-state)))
 
 (defun mykie:get-comment/string-state ()
   "Return :comment if current point is comment or string face."
@@ -220,14 +294,14 @@ THEN-FORM and ELSE-FORMS are then excuted just like in `if'."
                                 (if (bobp) (point) (1- (point))))))
     :comment))
 
-(defun mykie:get-major-mode-state (&optional C-u-prefix)
-  (when (or (and C-u-prefix
-                 current-prefix-arg)
-            (and (not C-u-prefix)
-                 (null current-prefix-arg)))
-    (lexical-let
-        ((prefix (if C-u-prefix ":C-u&" ":")))
-      (intern (concat prefix (symbol-name major-mode))))))
+(defun mykie:get-major-mode-state (&optional prefix)
+  "Return :major-mode, :C-u&major-mode or :region&major-mode if
+you specified same state name to `mykie's args and matched
+condition if you specified prefix(whether current-prefix-arg or region
+active).
+The major-mode replaced to `major-mode' name.
+You can specify \"C-u&\" or \"region&\" to the PREFIX."
+  (mykie:concat-prefix-if-exist major-mode prefix))
 
 (defun mykie:get-prefix-arg-state ()
   "Return keyword like :C-u, :C-*N or :M-N.
@@ -247,18 +321,77 @@ call `mykie' function."
 ;; Backward compatibility
 (defalias 'mykie:get-C-u-keyword 'mykie:get-prefix-arg-state)
 
+(defun mykie:get-prog-mode-state (&optional prefix)
+  "Return :prog, :C-u&prog or :region&prog state if current buffer is
+buffer that related programming. You can specify \"C-u&\" or
+\"region&\" to PREFIX. You can use this function from Emacs 24.
+Because this function utilize `prog-mode-hook'."
+  (when mykie:prog-mode-flag
+    (mykie:concat-prefix-if-exist 'prog prefix)))
+
 (defun mykie:get-skk-state ()
+  "Return SKK(simple kana kanji)'s state.
+If `on'(▽) mode then return :skk-on.
+If `active'(▼) mode then return :skk-active."
   (when (bound-and-true-p skk-mode)
     (case (bound-and-true-p skk-henkan-mode)
       (active :skk-active)
       (on     :skk-on))))
 
+(defun mykie:major-mode-key-exist-p (args)
+  "Return function symbol if same key as the major-mode's key exists."
+  (destructuring-bind (key . keymap) (plist-get args :key-info)
+    (lookup-key
+     (eval (intern (concat (symbol-name major-mode) "-map")))
+     (kbd key))))
+
+(defun mykie:ignore-mode-p ()
+  "Return non-nil if matched specified modes.
+If you specified :ignore-major-modes with major-mode's list to mykie's args,
+then check whether major-mode list match current major-mode.
+If you specified :ignore-minor-modes with minor-mode's list to mykie's args,
+then check whether minor-mode list match current `minor-mode-list'."
+  (or (member major-mode
+              (plist-get mykie:current-args :ignore-major-modes))
+      (loop for mode in (plist-get mykie:current-args :ignore-minor-modes)
+            if (member mode minor-mode-list)
+            do (return t))))
+
+(defun mykie:initialize ()
+  (setq mykie:conditions
+        (append
+         ;; REGION
+         mykie:before-user-region-conditions
+         mykie:region-conditions
+         mykie:after-user-region-conditions
+         ;; PREFIX-ARGUMENT
+         mykie:before-user-prefix-arg-conditions
+         mykie:prefix-arg-conditions
+         mykie:after-user-prefix-arg-conditions
+         ;; NORMAL
+         mykie:before-user-normal-conditions
+         mykie:normal-conditions
+         mykie:after-user-normal-conditions))
+  (when mykie:use-major-mode-key-override
+    (add-hook 'change-major-mode-after-body-hook 'mykie:attach-mykie-func-to)))
+
 (defun mykie:init (args)
+  "Initialize mykie's global-variable before do mykie's command."
   (when (plist-get args :use-C-u-num)
     (mykie:get-C-u-times))
-  (setq mykie:current-args args))
+  (setq mykie:current-args args)
+  (lexical-let
+      ((fallback (funcall mykie:get-fallback-function args)))
+    (when fallback
+      (mykie:execute fallback)
+      'exit)))
 
 (defun mykie:region-init ()
+  "Initialize mykie's global-variable for region.
+You can use `mykie:region-str' variable that store region string.
+If you specified 'kill or 'copy with :region-handle-flag of mykie's args,
+then do `kill-region' or `copy-region-as-kill' before do mykie's command.
+So you can use kill-ring variable that store region's variable if you want."
   (setq mykie:region-str
         (buffer-substring (region-beginning) (region-end)))
   (case (plist-get mykie:current-args :region-handle-flag)
@@ -266,6 +399,8 @@ call `mykie' function."
     (copy (copy-region-as-kill (region-beginning) (region-end)))))
 
 (defun mykie:deactivate-mark ()
+  "Deactivate region if you specified :deactivate-region of mykie's
+args with non-nil after do mykie's command."
   (lexical-let
       ((deactivation
         (plist-get mykie:current-args :deactivate-region)))
@@ -298,15 +433,13 @@ If you set 'region then deactivate region when you did not push C-u.
 If you set 'region&C-u then deactivate region when you pushed C-u.
 If you set t then deactivate region in both cases.
 You can use `mykie:region-str' variable that have region's string."
-  (mykie:init args)
-  (loop for condition in mykie:conditions
+  (loop initially (when (eq 'exit (mykie:init args)) (return))
+        for condition in mykie:conditions
         for state = (eval condition)
         for func  = (plist-get args state)
         if (member state args) do
         (setq mykie:current-state state)
-        (mykie:run-hook 'before)
         (mykie:execute func)
-        (mykie:run-hook 'after)
         (return)
         finally (mykie:execute (plist-get args :default)))
   (unless (mykie:repeat-p)
@@ -344,12 +477,40 @@ Example:
 (defun mykie:define-key-core (keymap-name keymap key &rest args)
   (unless (memq keymap mykie:keymaps) (push keymap mykie:keymaps))
   (lexical-let* ((key (mykie:format-key key))
-                 (args args)
+                 (args (append args `(:key-info (,key . ,keymap-name))))
                  ;; Workaround: Assign command name
                  (sym (funcall mykie:make-funcname-function
                                args mykie:keymaps keymap key keymap-name)))
     (fset sym (lambda () (interactive) (apply 'mykie args)))
-    (define-key keymap key sym)))
+    (define-key keymap key sym)
+    (mykie:aif (plist-get args :clone)
+        (mykie:clone-key it args '(:default self-insert-command)))))
+
+(defun mykie:clone-key (key args default-keyword-and-func &optional keymap-info)
+  (lexical-let
+      ((new-args
+        (mykie:filter (mykie:replace-property args default-keyword-and-func)
+                      :clone))
+       (map-name (or (car keymap-info) "global-map"))
+       (map      (or (cdr keymap-info)  global-map)))
+    (apply 'mykie:define-key-core map-name map key new-args)))
+
+(defun mykie:replace-property (args key-and-property)
+  (append (mykie:filter args (car key-and-property))
+          key-and-property))
+
+(defun mykie:filter (args keyword)
+  "Delete KEYWORD and the KEYWORD's function or property."
+  (if (not (member keyword args))
+      args
+    (loop with last = (1- (length args))
+          with result = '()
+          with ignore = nil
+          for i from 0 to last
+          if (eq keyword (nth i args))
+          do (push (1+ i) ignore)
+          else if (not (member i ignore))
+          collect (nth i args))))
 
 (defun mykie:global-set-key (key &rest args)
   "Give KEY a global binding as `mykie' command.
@@ -368,8 +529,16 @@ Example:
 Example:
   (mykie:define-key-with-self-key
       \"a\" :C-u '(message \"I am C-u\"))"
+  (add-to-list 'mykie:self-insert-keys `(,key ,args))
   (apply 'mykie:define-key-core "global-map" global-map (mykie:format-key key)
-         (append args '(:default self-insert-command))))
+         (append args
+                 '(:default self-insert-command)
+                 (mykie:aif mykie:ignore-major-modes-for-self-insert-key
+                     `(:ignore-major-modes ,it)
+                   nil)
+                 (mykie:aif mykie:ignore-minor-modes-for-self-insert-key
+                     `(:ignore-minor-modes ,it)
+                   nil))))
 (put 'mykie:define-key-with-self-key 'lisp-indent-function 1)
 
 (defmacro mykie:set-keys (keymap-or-order &rest args)
@@ -404,34 +573,37 @@ Examples:
    :C-u '(message \"called b\"))"
   `(let ((order (or ,keymap-or-order 'global)))
      (if (keymapp ,keymap-or-order)
-         (mykie:set-keys-core
-          (symbol-name ,keymap-or-order) order ,keymap-or-order ,@args)
-       (mykie:set-keys-core nil order global-map ,@args))))
+         (mykie:set-keys-core order ,keymap-or-order ,@args)
+       (mykie:set-keys-core order global-map ,@args))))
+(put 'mykie:set-keys 'lisp-indent-function 1)
 
-(defun mykie:set-keys-core (keymap-name order keymap &rest args)
+(defun mykie:set-keys-core (order keymap &rest args)
   (lexical-let
-      ((set-keys (lambda (func &optional keymap)
-                   (loop with tmp = '()
+      ((set-keys (lambda (func)
+                   (loop with key-and-prop = '()
                          with last = (1- (length args))
+                         with keymap-name = (quote keymap)
                          for i from 0 to last
                          for next = (1+ i)
                          for key-or-prop = (nth i args)
-                         collect key-or-prop into tmp
+                         collect key-or-prop into key-and-prop
                          if (or (equal i last)
-                                (typecase (nth next args)
-                                  (string t)
-                                  (vector t)))
+                                (and (not (eq :clone (nth i args)))
+                                     (typecase (nth next args)
+                                       (string t)
+                                       (vector t))))
                          do (progn
-                              (if keymap
-                                  (apply func keymap-name keymap tmp)
-                                (apply func tmp))
-                              (setq tmp nil))))))
+                              (case func
+                                (mykie:define-key-core
+                                 (apply func keymap-name keymap key-and-prop))
+                                (t (apply func key-and-prop)))
+                              (setq key-and-prop nil))))))
     (case order
       (global
        (funcall set-keys 'mykie:global-set-key))
       (with-self-key
        (funcall set-keys 'mykie:define-key-with-self-key))
-      (t (funcall set-keys 'mykie:define-key-core keymap)))))
+      (t (funcall set-keys 'mykie:define-key-core)))))
 
 (unless mykie:conditions
   (mykie:initialize))
